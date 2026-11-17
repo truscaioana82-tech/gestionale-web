@@ -4,6 +4,9 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from datetime import datetime
 import io
+import sqlite3
+import tempfile
+import os
 
 # --- CONFIGURAZIONE PAGINA ---
 st.set_page_config(page_title="Contabilità BAGLI & TROPEA", page_icon="📊", layout="wide")
@@ -75,7 +78,7 @@ def normalizza_e_controlla_data(data_str, scelta, anno_sel, mese_o_semestre_sel)
     dt = None
     for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
         try:
-            dt = datetime.strptime(data_str.strip(), fmt)
+            dt = datetime.strptime(str(data_str).strip()[:10], fmt)
             break
         except ValueError:
             continue
@@ -105,8 +108,8 @@ def calcola_metriche_soci(righe, scelta, anno_sel, mese_semestre_sel):
             continue
         socio = riga["socio"]
         tipo = riga["tipo"]
-        imponibile = float(riga["imponibile"])
-        iva_perc = int(riga["iva_perc"])
+        imponibile = float(riga["imponibile"] or 0.0)
+        iva_perc = int(riga["iva_perc"] or 0)
         rit_perc = int(riga["ritenuta_perc"] or 0)
         c_dip = float(riga["costo_dipendenti"] or 0.0)
 
@@ -144,7 +147,7 @@ if check_password():
     st.sidebar.title("CONTABILITÀ IMPRESA")
     st.sidebar.subheader("Configurazione Periodo")
     
-    scelta_periodo = st.sidebar.selectbox("Tipo Periodo", ["Semestrale", "Mensile", "Annuale", "Tutto lo Storico"])
+    scelta_periodo = st.sidebar.selectbox("Tipo Periodo", ["Tutto lo Storico", "Semestrale", "Mensile", "Annuale"])
     anno_sel = st.sidebar.selectbox("Anno", [str(a) for a in range(datetime.now().year, 2020, -1)])
     
     mese_semestre_sel = ""
@@ -156,12 +159,18 @@ if check_password():
 
     conn = get_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
-    cur.execute("SELECT * FROM fatture ORDER BY id DESC")
+    cur.execute("SELECT * FROM fatture ORDER BY data_doc DESC, id DESC")
     righe_db = cur.fetchall()
     cur.close()
     conn.close()
 
-    tab1, tab2, tab3, tab4 = st.tabs(["📊 Cruscotto & Bilancio", "➕ Nuova Fattura", "📋 Registro & Modifica", "📥 Esporta Excel"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "📊 Cruscotto & Bilancio", 
+        "➕ Nuova Fattura", 
+        "📋 Registro & Modifica", 
+        "📥 Esporta Excel",
+        "📤 Importa Storico"
+    ])
 
     # --- TAB 1: CRUSCOTTO ---
     with tab1:
@@ -243,7 +252,7 @@ if check_password():
             righe_filtrate.append(r)
             tot_filtrato += -r["imponibile"] if r["tipo"] == "NOTA_CREDITO" else r["imponibile"]
 
-        st.success(f"**Totale Imponibile Corrente Filtrato:** € {tot_filtrato:,.2f}")
+        st.success(f"**Totale Imponibile Corrente Filtrato ({len(righe_filtrate)} documenti):** € {tot_filtrato:,.2f}")
         
         if righe_filtrate:
             df_vis = pd.DataFrame(righe_filtrate)
@@ -302,3 +311,63 @@ if check_password():
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True
             )
+
+    # --- TAB 5: IMPORTAZIONE STORICO DA EXCEL O DB ---
+    with tab5:
+        st.subheader("📤 Importa Dati dal Vecchio Gestionale")
+        st.write("Carica qui il tuo file **`.xlsx`** (es. `registro_individuale_soci.xlsx`) oppure il database **`contabilita_soci.db`** per trasferire tutte le fatture nel database cloud.")
+        
+        file_caricato = st.file_uploader("Seleziona file Excel (.xlsx) o Database (.db)", type=["xlsx", "db", "sqlite", "sqlite3"])
+        svuota_prima = st.checkbox("Svuota il database cloud prima di importare (consigliato per evitare doppioni)", value=True)
+        
+        if file_caricato is not None:
+            if st.button("🚀 Avvia Importazione Completa", type="primary", use_container_width=True):
+                try:
+                    if file_caricato.name.endswith(".xlsx"):
+                        df_imp = pd.read_excel(file_caricato)
+                    else:
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+                            tmp.write(file_caricato.getvalue())
+                            tmp_path = tmp.name
+                        sq_conn = sqlite3.connect(tmp_path)
+                        df_imp = pd.read_sql_query("SELECT * FROM fatture", sq_conn)
+                        sq_conn.close()
+                        os.remove(tmp_path)
+
+                    conn = get_connection()
+                    cur = conn.cursor()
+                    if svuota_prima:
+                        cur.execute("DELETE FROM fatture")
+
+                    count = 0
+                    for _, row in df_imp.iterrows():
+                        socio_val = str(row.get("socio", "")).strip()
+                        if socio_val == "SOCIO B":
+                            socio_val = SOCIO_1
+                        elif socio_val == "SOCIO L":
+                            socio_val = SOCIO_2
+
+                        data_val = str(row.get("data_doc", "")).strip()[:10]
+                        tipo_val = str(row.get("tipo", "EMESSA")).strip()
+                        num_val = str(row.get("num", "")).strip()
+                        anag_val = str(row.get("anagrafica", "")).strip()
+                        imp_val = float(row.get("imponibile", 0.0) or 0.0)
+                        iva_val = int(row.get("iva_perc", 0) or 0)
+                        rit_val = int(row.get("ritenuta_perc", 0) or 0)
+                        dip_val = float(row.get("costo_dipendenti", 0.0) or 0.0)
+
+                        cur.execute(
+                            """INSERT INTO fatture (tipo, num, anagrafica, imponibile, iva_perc, socio, ritenuta_perc, costo_dipendenti, data_doc) 
+                               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                            (tipo_val, num_val, anag_val, imp_val, iva_val, socio_val, rit_val, dip_val, data_val)
+                        )
+                        count += 1
+
+                    conn.commit()
+                    cur.close()
+                    conn.close()
+                    st.success(f"✅ Importati con successo {count} documenti nel database online!")
+                    st.balloons()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Errore durante l'importazione: {e}")
